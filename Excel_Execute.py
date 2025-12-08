@@ -2,9 +2,14 @@ import pandas as pd
 import tkinter.messagebox as messagebox
 import openpyxl
 import re
+import os
+
 from typing import List, Dict
 
 from pyexpat.errors import messages
+
+# Navigate exactly where contains script
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 Required_columns = {'STT', 'Full_Name', 'Academic_Year', 'Email'}
 
@@ -88,14 +93,9 @@ def read_recipients(path: str) -> List[Dict]:
                        'Email': mail})
 
         # Nếu có lỗi → thông báo tổng hợp
-        if errors:
-            error_text = "\n".join(errors)
-            messagebox.showerror("Data Validation Errors", error_text)
-            return result
+    if errors:
+        error_text = "\n".join(errors)
+        messagebox.showerror("Data Validation Errors", error_text)
+        return result
 
     return result
-
-
-
-
-
