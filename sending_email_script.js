@@ -476,3 +476,22 @@ function exportTwoDocsToHtml() {
 
   Logger.log("🎉 Done! Created male.html & female.html");
 }
+
+// Get field ID
+function showGetIdDialog() {
+  const html = HtmlService.createHtmlOutput(`
+    <label>Paste Google Doc/Drive link:</label>
+    <input type="text" id="link" style="width:300px;">
+    <button onclick="getId()">Get ID</button>
+    <p id="result"></p>
+    <script>
+      function getId() {
+        const link = document.getElementById('link').value;
+        const match = link.match(/\\/d\\/([a-zA-Z0-9-_]+)/);
+        document.getElementById('result').innerText = match ? match[1] : 'Invalid link';
+      }
+    </script>
+  `).setWidth(400).setHeight(200);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Get Google Doc ID');
+}
+
