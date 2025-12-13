@@ -168,6 +168,14 @@ function sendScheduledBatch() {
   };
   validateColumnIndex(idx, header);
 
+  // Reset temporary "Ready" statuses to empty so they can be sent
+  for (let i = 0; i < rows.length; i++) {
+    if ((rows[i][idx.status] || "").toString().trim().toLowerCase() === "ready") {
+      recipientsSheet.getRange(i + 2, idx.status + 1).setValue(""); // reset Ready -> empty
+      rows[i][idx.status] = ""; // cập nhật mảng local luôn
+    }
+  }
+  
   const pending = rows
     .map((r, i) => ({ r, row: i + 2 }))
     .filter(e => !e.r[idx.status] || e.r[idx.status].toString().trim().toLowerCase() === "pending");
