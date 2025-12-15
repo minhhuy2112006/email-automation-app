@@ -6,7 +6,7 @@ function getSettings() {
   const ss = SpreadsheetApp.getActive();
   const sheet = ss.getSheetByName("Setting Overal");
 
-  const values = sheet.getRange(2, 1, 1, 11).getValues()[0]; // 11 cột tổng
+  const values = sheet.getRange(2, 1, 1, 12).getValues()[0]; // thêm 1 cột
 
   const useInline = (values[4] || "").toString().trim().toLowerCase() === "yes";
   const imageFolderId = useInline ? (values[8] || "") : "";
@@ -14,10 +14,16 @@ function getSettings() {
   const useAttachment = (values[9] || "").toString().trim().toLowerCase() === "yes";
   const attachmentFolderId = useAttachment ? (values[10] || "") : "";
 
+  // --- TEMPLATE MODE ---
+  let templateMode = (values[11] || "gender").toString().trim().toLowerCase();
+  if (templateMode !== "single" && templateMode !== "gender") {
+    templateMode = "gender"; // fallback an toàn
+  }
+
   return {
     subject: values[0],
     send_time: values[1],
-    template_male: values[2],
+    template_male: values[2],     // dùng cho male hoặc single
     template_female: values[3],
     use_inline_image: useInline,
     batch_size: Number(values[5]) || 10,
@@ -25,10 +31,10 @@ function getSettings() {
     max_delay_seconds: Number(values[7]) || 45,
     image_folder_id: imageFolderId,
     use_attachment: useAttachment,
-    attachment_folder_id: attachmentFolderId
+    attachment_folder_id: attachmentFolderId,
+    template_mode: templateMode
   };
 }
-
 
 
 function loadHtmlFromDrive(fileId) {
@@ -39,6 +45,79 @@ function loadHtmlFromDrive(fileId) {
     throw new Error("Cannot access template file. Check ID and permissions.");
   }
 }
+
+function loadTemplates(settings) {
+  let htmlMale = null;
+  let htmlFemale = null;
+  let htmlSingle = null;
+
+  if (settings.template_mode === "single") {
+    if (!settings.template_male) {
+      throw new Error("❌ SINGLE mode nhưng template_male trống");
+    }
+    htmlSingle = fixGoogleDocsBullet(
+      loadHtmlFromDrive(settings.template_male)
+    );
+  } else {
+    if (!settings.template_male && !settings.template_female) {
+      throw new Error("❌ GENDER mode nhưng cả male & female template đều trống");
+    }
+
+    if (settings.template_male) {
+      htmlMale = fixGoogleDocsBullet(
+        loadHtmlFromDrive(settings.template_male)
+      );
+    }
+
+    if (settings.template_female) {
+      htmlFemale = fixGoogleDocsBullet(
+        loadHtmlFromDrive(settings.template_female)
+      );
+    }
+  }
+
+  return { htmlMale, htmlFemale, htmlSingle };
+}
+
+
+function getTemplateForRecipient(settings, templates, gender) {
+  if (settings.template_mode === "single") {
+    if (!templates.htmlSingle) {
+      throw new Error("Single mode but template missing");
+    }
+    return templates.htmlSingle;
+  }
+
+  const g = gender.toLowerCase();
+
+  if ((g === "female" || g === "nữ" || g === "nu")) {
+    if (!templates.htmlFemale) {
+      throw new Error("Female template missing");
+    }
+    return templates.htmlFemale;
+  }
+
+  if ((g === "male" || g === "nam")) {
+    if (!templates.htmlMale) {
+      throw new Error("Male template missing");
+    }
+    return templates.htmlMale;
+  }
+
+  throw new Error("Invalid gender: " + gender);
+}
+
+
+
+function applyTemplate(html, data) {
+  if (!html) return "";
+
+  return html.replace(/\{(\w+)\}/g, (_, key) => {
+    return data[key] !== undefined ? data[key] : `{${key}}`;
+  });
+}
+
+
 
 // FIX GOOGLE DOCS BULLET (robust, no double-bullet)
 function fixGoogleDocsBullet(html) {
@@ -94,6 +173,23 @@ function getAttachmentFile(folderId) {
   }
 }
 
+function getAttachmentFileNames(folderId) {
+  if (!folderId) return [];
+
+  try {
+    const folder = DriveApp.getFolderById(folderId);
+    const files = folder.getFiles();
+    const names = [];
+
+    while (files.hasNext()) {
+      const f = files.next();
+      names.push(f.getName());
+    }
+    return names;
+  } catch (e) {
+    return [];
+  }
+}
 
 
 function parseSendTime(str) {
@@ -146,14 +242,11 @@ function sendScheduledBatch() {
   const logSheet = ss.getSheetByName("log");
   const archiveSheet = ss.getSheetByName("Archive");
   const settings = getSettings();
+  const templates = loadTemplates(settings);
 
   const sendTime = parseSendTime(settings.send_time);
   if (!sendTime) return;
-  const now = new Date();
-  if (now < sendTime) return;
-
-  let htmlMale = fixGoogleDocsBullet(loadHtmlFromDrive(settings.template_male));
-  let htmlFemale = fixGoogleDocsBullet(loadHtmlFromDrive(settings.template_female));
+  if (new Date() < sendTime) return;
 
   const data = recipientsSheet.getDataRange().getValues();
   const header = data[0].map(h => h.toString().trim().toLowerCase());
@@ -168,43 +261,85 @@ function sendScheduledBatch() {
   };
   validateColumnIndex(idx, header);
 
-  // Reset temporary "Ready" statuses to empty so they can be sent
-  for (let i = 0; i < rows.length; i++) {
-    if ((rows[i][idx.status] || "").toString().trim().toLowerCase() === "ready") {
-      recipientsSheet.getRange(i + 2, idx.status + 1).setValue(""); // reset Ready -> empty
-      rows[i][idx.status] = ""; // cập nhật mảng local luôn
-    }
-  }
-  
-  const pending = rows
+  // Lấy các dòng có thể gửi
+  const candidates = rows
     .map((r, i) => ({ r, row: i + 2 }))
-    .filter(e => !e.r[idx.status] || e.r[idx.status].toString().trim().toLowerCase() === "pending");
-  if (pending.length === 0) return;
+    .filter(e => {
+      const s = (e.r[idx.status] || "").toString().trim().toLowerCase();
+      return s === "" || s === "pending" || s === "ready";
+    });
 
-  const batch = pending.slice(0, settings.batch_size);
+  if (candidates.length === 0) return;
 
-  // Lấy attachment chung nếu có
+  const batch = candidates.slice(0, settings.batch_size);
+
+  // Attachment chung
   let sharedAttachment = null;
   if (settings.use_attachment && settings.attachment_folder_id) {
     sharedAttachment = getAttachmentFile(settings.attachment_folder_id);
-    if (!sharedAttachment) Logger.log("⚠️ Không tìm thấy file đính kèm trong folder " + settings.attachment_folder_id);
   }
 
   for (let i = 0; i < batch.length; i++) {
-    const entry = batch[i];
-    const row = entry.r;
-    const rowIndex = entry.row;
+    const { r: row, row: rowIndex } = batch[i];
+
+    const email = row[idx.email];
+    const name = row[idx.name];
+    const rawGender = (row[idx.gender] || "").toString().trim().toLowerCase();
+    const academicYear = row[idx.academic_year] || "";
 
     let status = "Successful";
     let errorMessage = "";
 
-    const email = row[idx.email];
-    const name = row[idx.name];
-    const gender = (row[idx.gender] || "").toString().toLowerCase();
-    const academicYear = row[idx.academic_year] || "";
+    // =====================
+    // VALIDATE GENDER + TEMPLATE
+    // =====================
+    if (settings.template_mode === "gender") {
+      if (!["male", "female", "nam", "nữ", "nu"].includes(rawGender)) {
+        status = "Failed";
+        errorMessage = "Invalid gender value: " + rawGender;
+      }
 
-    const template = (gender.startsWith("nữ") || gender === "nu") ? htmlFemale : htmlMale;
+      if (status === "Successful") {
+        const isFemale = rawGender === "female" || rawGender === "nữ" || rawGender === "nu";
+        const isMale   = rawGender === "male" || rawGender === "nam";
+
+        if (isFemale && !templates.htmlFemale) {
+          status = "Failed";
+          errorMessage = "Female gender but female template missing";
+        }
+
+        if (isMale && !templates.htmlMale) {
+          status = "Failed";
+          errorMessage = "Male gender but male template missing";
+        }
+      }
+    }
+
+    // ⛔ FAIL → LOG + ARCHIVE + CONTINUE
+    if (status === "Failed") {
+      recipientsSheet.getRange(rowIndex, idx.status + 1).setValue("Failed");
+      setStatusColor(recipientsSheet, rowIndex, idx.status + 1, "Failed");
+
+      logSheet.appendRow([new Date(), name, email, "Failed", errorMessage]);
+
+      archiveSheet.appendRow([
+        new Date(),
+        name,
+        academicYear,
+        row[idx.gender],
+        email,
+        "Failed",
+        errorMessage
+      ]);
+
+      continue; // ⛔ KHÔNG GỬI
+    }
+
+    const gender = rawGender;
+    const template = getTemplateForRecipient(settings, templates, gender);
+
     let html = template.replace(/\{0\}/g, name);
+
     let options = { htmlBody: html };
 
     // Inline image
@@ -212,29 +347,26 @@ function sendScheduledBatch() {
       const imgBlob = getRecipientImageByName(name, settings.image_folder_id);
       if (!imgBlob) {
         status = "Failed";
-        errorMessage = "Image not found for: " + name;
+        errorMessage = "Image not found";
       } else {
-        options.inlineImages = { "image": imgBlob };
+        options.inlineImages = { image: imgBlob };
         html += '<br><img src="cid:image" style="max-width:300px;">';
         options.htmlBody = html;
       }
     }
 
-    // Gắn attachment chung
     if (sharedAttachment && status === "Successful") {
       options.attachments = [sharedAttachment];
     }
 
-    // Thử gửi email
     if (status === "Successful") {
       try {
         GmailApp.sendEmail(email, settings.subject, "", options);
       } catch (err) {
         if (err.toString().toLowerCase().includes("service invoked too many times")) {
-          // Quota exceeded → tạo draft
           GmailApp.createDraft(email, settings.subject, "", options);
           status = "Draft";
-          errorMessage = "Quota exceeded, saved as draft";
+          errorMessage = "Quota exceeded";
         } else {
           status = "Failed";
           errorMessage = err.toString();
@@ -242,18 +374,11 @@ function sendScheduledBatch() {
       }
     }
 
-    // Cập nhật status + màu
     recipientsSheet.getRange(rowIndex, idx.status + 1).setValue(status);
-    if (status === "Draft") {
-      recipientsSheet.getRange(rowIndex, idx.status + 1).setBackground("#fff2cc"); // vàng
-    } else {
-      setStatusColor(recipientsSheet, rowIndex, idx.status + 1, status);
-    }
+    setStatusColor(recipientsSheet, rowIndex, idx.status + 1, status);
 
-    // Log
     logSheet.appendRow([new Date(), name, email, status, errorMessage]);
 
-    // Archive (có Academic Year)
     archiveSheet.appendRow([
       new Date(),
       name,
@@ -264,29 +389,42 @@ function sendScheduledBatch() {
       errorMessage
     ]);
 
-    // Delay
     if (i < batch.length - 1) {
-      let min = settings.min_delay_seconds;
-      let max = settings.max_delay_seconds;
-      if (max > 15) max = 15;
-      if (min > max) min = max;
-      const wait = Math.floor(Math.random() * (max - min + 1)) + min;
-      Utilities.sleep(wait * 1000);
+      Utilities.sleep(
+        Math.min(
+          Math.max(settings.min_delay_seconds, 1),
+          Math.min(settings.max_delay_seconds, 15)
+        ) * 1000
+      );
     }
   }
+  // ================================
+  // CLEAN SENT ROWS (SUCCESS + DRAFT)
+  // ================================
+  const lastRow = recipientsSheet.getLastRow();
+  if (lastRow <= 1) return;
 
-  // Xóa các dòng đã gửi hoặc draft khỏi Recipients
-  const last = recipientsSheet.getLastRow();
-  if (last > 1) {
-    const allRows = recipientsSheet.getRange(2, 1, last - 1, header.length).getValues();
-    const keepRows = allRows.filter(r => {
-      const s = (r[idx.status] || "").toString().trim().toLowerCase();
-      return s === "" || s.toLowerCase() === "pending" || s.toLowerCase() === "failed";
-    });
-    recipientsSheet.deleteRows(2, last - 1);
-    if (keepRows.length > 0) {
-      recipientsSheet.getRange(2, 1, keepRows.length, keepRows[0].length).setValues(keepRows);
-    }
+  const bodyRange = recipientsSheet.getRange(2, 1, lastRow - 1, header.length);
+  const allRows = bodyRange.getValues();
+
+  const keepRows = allRows.filter(r => {
+    const s = (r[idx.status] || "").toString().trim().toLowerCase();
+    return s === "" || s === "pending" || s === "failed";
+  });
+
+  // ⛔ Không cần làm gì nếu không có thay đổi
+  if (keepRows.length === allRows.length) {
+    return;
+  }
+
+  // 🔥 Xóa body cũ
+  bodyRange.clearContent();
+
+  // ✍️ Ghi lại nếu còn rows
+  if (keepRows.length > 0) {
+    recipientsSheet
+      .getRange(2, 1, keepRows.length, keepRows[0].length)
+      .setValues(keepRows);
   }
 }
 
@@ -294,9 +432,7 @@ function previewScheduledBatch() {
   const ss = SpreadsheetApp.getActive();
   const recipientsSheet = ss.getSheetByName("Recipients");
   const settings = getSettings();
-
-  let htmlMale = fixGoogleDocsBullet(loadHtmlFromDrive(settings.template_male));
-  let htmlFemale = fixGoogleDocsBullet(loadHtmlFromDrive(settings.template_female));
+  const templates = loadTemplates(settings);
 
   const data = recipientsSheet.getDataRange().getValues();
   const header = data[0].map(h => h.toString().trim().toLowerCase());
@@ -310,63 +446,67 @@ function previewScheduledBatch() {
   };
   validateColumnIndex(idx, header);
 
-  // --- Lấy file attachment chung nếu có ---
-  let sharedAttachment = null;
-  let sharedAttachmentName = "No attachment";
+  // --- Attachment info ---
+  let attachmentInfo = "";
   if (settings.use_attachment && settings.attachment_folder_id) {
-    const folder = DriveApp.getFolderById(settings.attachment_folder_id);
-    const files = folder.getFiles();
-    if (files.hasNext()) {
-      sharedAttachment = files.next();
-      sharedAttachmentName = sharedAttachment.getName();
+    try {
+      const folder = DriveApp.getFolderById(settings.attachment_folder_id);
+      const files = folder.getFiles();
+      const names = [];
+      while (files.hasNext()) names.push(files.next().getName());
+      if (names.length > 0) {
+        attachmentInfo = `<div style="margin-top:4px; white-space: normal; word-break: break-word; line-height: 1.4;"><b>Attachment:</b> <span>${names.join(", ")}</span></div>`;
+      }
+    } catch (e) {
+      attachmentInfo = `<div><b>Attachment:</b> (cannot read files)</div>`;
     }
   }
 
-  let previewHtml = '<h2>Email Preview</h2><hr>';
+  let previewHtml = "<h2></h2><hr>";
 
-  rows.forEach((row, i) => {
+  // --- chỉ preview top 10 ---
+  const previewRows = rows.slice(0, 10);
+
+  previewRows.forEach((row, i) => {
     const email = row[idx.email];
     const name = row[idx.name];
-    const gender = (row[idx.gender] || "").toString().toLowerCase();
+    const rawGender = (row[idx.gender] || "").toString().toLowerCase();
 
-    const template = (gender.startsWith("nữ") || gender === "nu") ? htmlFemale : htmlMale;
+    const gender = ["male", "female", "nam", "nữ", "nu", "single"].includes(rawGender)
+      ? rawGender
+      : "default";
+
+    const template = getTemplateForRecipient(settings, templates, gender);
     let html = template.replace(/\{0\}/g, name);
 
-    let status = "Ready"; // default
-    let imgHtml = '';
-
-    // Inline image
+    // --- Inline image preview ---
+    let imgHtml = "";
     if (settings.use_inline_image && settings.image_folder_id) {
       const imgBlob = getRecipientImageByName(name, settings.image_folder_id);
       if (imgBlob) {
         const base64 = Utilities.base64Encode(imgBlob.getBytes());
         imgHtml = `<br><img src="data:${imgBlob.getContentType()};base64,${base64}" style="max-width:300px;">`;
-      } else {
-        status = "Missing Image";
       }
     }
 
-    // Cập nhật tạm status vào sheet
-    recipientsSheet.getRange(i + 2, idx.status + 1).setValue(status);
+    // Set status Ready (tạm)
+    recipientsSheet.getRange(i + 2, idx.status + 1).setValue("Ready");
 
-    // --- Thêm thông tin attachment ---
-    let attachmentHtml = settings.use_attachment && sharedAttachmentName
-      ? `<b>Attachment:</b> ${sharedAttachmentName}<br>`
-      : '';
-
-    previewHtml += `<div style="margin-bottom:40px; padding:10px; border:1px solid #ccc;">
+    previewHtml += `<div style="border:1px solid #ccc; padding:10px; margin-bottom:30px;">
       <b>To:</b> ${email}<br>
       <b>Name:</b> ${name}<br>
-      <b>Status:</b> ${status}<br>
-      ${attachmentHtml}
-      <b>Content:</b><br>${html}${imgHtml}
+      <b>Status:</b> Ready
+      ${attachmentInfo}
+      <br>
+      ${html}
+      ${imgHtml}
     </div>`;
   });
 
-  const htmlOutput = HtmlService.createHtmlOutput(previewHtml)
-    .setWidth(800)
-    .setHeight(600);
-  SpreadsheetApp.getUi().showModalDialog(htmlOutput, "Email Preview");
+  SpreadsheetApp.getUi().showModalDialog(
+    HtmlService.createHtmlOutput(previewHtml).setWidth(900).setHeight(650),
+    "Email Preview"
+  );
 }
 
 
@@ -464,18 +604,30 @@ function exportTwoDocsToHtml() {
   const maleId = sheet.getRange("A2").getDisplayValue().trim();
   const femaleId = sheet.getRange("B2").getDisplayValue().trim();
   const folderId = sheet.getRange("C2").getDisplayValue().trim();
+  let mode = (sheet.getRange("D2").getDisplayValue() || "gender")
+    .toLowerCase()
+    .trim();
 
-  // Validate cơ bản
-  if (!maleId) throw new Error("❌ ID Doc male trống");
-  if (!femaleId) throw new Error("❌ ID Doc female trống");
+  if (mode !== "single" && mode !== "gender") {
+    mode = "gender"; // fallback
+  }
+
   if (!folderId) throw new Error("❌ Folder ID trống");
 
-  // Export 2 file
-  exportDocToCleanHtml(maleId, "male.html", folderId);
-  exportDocToCleanHtml(femaleId, "female.html", folderId);
+  if (mode === "single") {
+    if (!maleId) throw new Error("❌ ID Doc template chung trống");
+    exportDocToCleanHtml(maleId, "template.html", folderId);
+  } else {
+    if (!maleId || !femaleId) {
+      throw new Error("❌ Thiếu ID Doc male hoặc female");
+    }
+    exportDocToCleanHtml(maleId, "male.html", folderId);
+    exportDocToCleanHtml(femaleId, "female.html", folderId);
+  }
 
-  Logger.log("🎉 Done! Created male.html & female.html");
+  Logger.log("✅ Convert HTML DONE (" + mode + ")");
 }
+
 
 // Get field ID
 function showGetIdDialog() {
