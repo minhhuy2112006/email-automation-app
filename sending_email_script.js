@@ -6,29 +6,28 @@ function getSettings() {
   const ss = SpreadsheetApp.getActive();
   const sheet = ss.getSheetByName("Setting Overal");
 
-  const values = sheet.getRange(2, 1, 1, 12).getValues()[0]; // thêm 1 cột
+  const values = sheet.getRange(2, 1, 1, 11).getValues()[0]; // giảm 1 cột (bỏ send_time)
 
-  const useInline = (values[4] || "").toString().trim().toLowerCase() === "yes";
-  const imageFolderId = useInline ? (values[8] || "") : "";
+  const useInline = (values[3] || "").toString().trim().toLowerCase() === "yes";
+  const imageFolderId = useInline ? (values[7] || "") : "";
 
-  const useAttachment = (values[9] || "").toString().trim().toLowerCase() === "yes";
-  const attachmentFolderId = useAttachment ? (values[10] || "") : "";
+  const useAttachment = (values[8] || "").toString().trim().toLowerCase() === "yes";
+  const attachmentFolderId = useAttachment ? (values[9] || "") : "";
 
   // --- TEMPLATE MODE ---
-  let templateMode = (values[11] || "gender").toString().trim().toLowerCase();
+  let templateMode = (values[10] || "gender").toString().trim().toLowerCase();
   if (templateMode !== "single" && templateMode !== "gender") {
     templateMode = "gender"; // fallback an toàn
   }
 
   return {
     subject: values[0],
-    send_time: values[1],
-    template_male: values[2],     // dùng cho male hoặc single
-    template_female: values[3],
+    template_male: values[1],     // dùng cho male hoặc single
+    template_female: values[2],
     use_inline_image: useInline,
-    batch_size: Number(values[5]) || 10,
-    min_delay_seconds: Number(values[6]) || 20,
-    max_delay_seconds: Number(values[7]) || 45,
+    batch_size: Number(values[4]) || 10,
+    min_delay_seconds: Number(values[5]) || 20,
+    max_delay_seconds: Number(values[6]) || 45,
     image_folder_id: imageFolderId,
     use_attachment: useAttachment,
     attachment_folder_id: attachmentFolderId,
@@ -40,9 +39,17 @@ function getSettings() {
 function loadHtmlFromDrive(fileId) {
   if (!fileId) throw new Error("Template ID is missing!");
   try {
-    return DriveApp.getFileById(fileId).getBlob().getDataAsString("UTF-8");
+    const file = DriveApp.getFileById(fileId);
+    const mimeType = file.getMimeType();
+    
+    // Kiểm tra xem có phải file HTML không
+    if (mimeType !== "text/html") {
+      throw new Error(`File is ${mimeType}, not HTML. Please use HTML file ID (exported from Google Doc)`);
+    }
+    
+    return file.getBlob().getDataAsString("UTF-8");
   } catch (err) {
-    throw new Error("Cannot access template file. Check ID and permissions.");
+    throw new Error(`Cannot access template file [ID: ${fileId}]. Error: ${err.message}`);
   }
 }
 
@@ -192,19 +199,13 @@ function getAttachmentFileNames(folderId) {
 }
 
 
-function parseSendTime(str) {
-  if (!str) return null;
-  if (str instanceof Date) return str;
-
-  const formatted = str.toString().trim().replace(" ", "T");
-  return new Date(formatted);
-}
-
 function setStatusColor(sheet, row, col, status) {
   if (status === "Successful") {
     sheet.getRange(row, col).setBackground("#b7e1cd");
   } else if (status === "Failed") {
     sheet.getRange(row, col).setBackground("#f4c7c3");
+  } else if (status === "Draft") {
+    sheet.getRange(row, col).setBackground("#fff2cc");
   } else {
     sheet.getRange(row, col).setBackground(null);
   }
@@ -236,17 +237,56 @@ function getRecipientImageByName(name, folderId) {
 // Main Logic       //
 //////////////////////
 
-function sendScheduledBatch() {
+// HÀM GỬI EMAIL (MODE: SEND)
+function sendEmails() {
+  const ui = SpreadsheetApp.getUi();
+  
+  // Xác nhận trước khi gửi
+  const response = ui.alert(
+    'Xác nhận gửi email',
+    'Bạn có chắc chắn muốn gửi email không?',
+    ui.ButtonSet.YES_NO
+  );
+  
+  if (response !== ui.Button.YES) {
+    return; // Người dùng chọn NO hoặc đóng dialog
+  }
+  
+  // Tiến hành gửi
+  processBatch(false); // false = send mode
+  
+  ui.alert('Hoàn tất', 'Đã gửi email xong!', ui.ButtonSet.OK);
+}
+
+// HÀM GỬI DRAFT
+function sendDrafts() {
+  const ui = SpreadsheetApp.getUi();
+  
+  // Xác nhận trước khi tạo draft
+  const response = ui.alert(
+    'Xác nhận tạo draft',
+    'Bạn có chắc chắn muốn tạo draft không?',
+    ui.ButtonSet.YES_NO
+  );
+  
+  if (response !== ui.Button.YES) {
+    return;
+  }
+  
+  // Tiến hành tạo draft
+  processBatch(true); // true = draft mode
+  
+  ui.alert('Hoàn tất', 'Đã tạo draft xong!', ui.ButtonSet.OK);
+}
+
+// HÀM XỬ LÝ BATCH (CHUNG CHO SEND & DRAFT)
+function processBatch(isDraftMode) {
   const ss = SpreadsheetApp.getActive();
   const recipientsSheet = ss.getSheetByName("Recipients");
   const logSheet = ss.getSheetByName("log");
   const archiveSheet = ss.getSheetByName("Archive");
   const settings = getSettings();
   const templates = loadTemplates(settings);
-
-  const sendTime = parseSendTime(settings.send_time);
-  if (!sendTime) return;
-  if (new Date() < sendTime) return;
 
   const data = recipientsSheet.getDataRange().getValues();
   const header = data[0].map(h => h.toString().trim().toLowerCase());
@@ -361,7 +401,15 @@ function sendScheduledBatch() {
 
     if (status === "Successful") {
       try {
-        GmailApp.sendEmail(email, settings.subject, "", options);
+        if (isDraftMode) {
+          // TẠO DRAFT
+          GmailApp.createDraft(email, settings.subject, "", options);
+          status = "Draft";
+        } else {
+          // GỬI EMAIL
+          GmailApp.sendEmail(email, settings.subject, "", options);
+          status = "Successful";
+        }
       } catch (err) {
         if (err.toString().toLowerCase().includes("service invoked too many times")) {
           GmailApp.createDraft(email, settings.subject, "", options);
@@ -398,6 +446,7 @@ function sendScheduledBatch() {
       );
     }
   }
+  
   // ================================
   // CLEAN SENT ROWS (SUCCESS + DRAFT)
   // ================================
@@ -407,6 +456,8 @@ function sendScheduledBatch() {
   const bodyRange = recipientsSheet.getRange(2, 1, lastRow - 1, header.length);
   const allRows = bodyRange.getValues();
 
+  // Chỉ giữ lại: "", "pending", "failed"
+  // Xóa: "Successful", "Draft"
   const keepRows = allRows.filter(r => {
     const s = (r[idx.status] || "").toString().trim().toLowerCase();
     return s === "" || s === "pending" || s === "failed";
@@ -426,6 +477,10 @@ function sendScheduledBatch() {
       .getRange(2, 1, keepRows.length, keepRows[0].length)
       .setValues(keepRows);
   }
+  
+  // Log summary
+  const removedCount = allRows.length - keepRows.length;
+  Logger.log(`✅ Removed ${removedCount} rows (Successful + Draft) from Recipients sheet`);
 }
 
 function previewScheduledBatch() {
@@ -462,7 +517,7 @@ function previewScheduledBatch() {
     }
   }
 
-  let previewHtml = "<h2></h2><hr>";
+  let previewHtml = "<h2>Email Preview</h2><hr>";
 
   // --- chỉ preview top 10 ---
   const previewRows = rows.slice(0, 10);
@@ -633,17 +688,45 @@ function exportTwoDocsToHtml() {
 function showGetIdDialog() {
   const html = HtmlService.createHtmlOutput(`
     <label>Paste Google Doc/Drive link:</label>
-    <input type="text" id="link" style="width:300px;">
+    <input type="text" id="link" style="width:400px;">
     <button onclick="getId()">Get ID</button>
-    <p id="result"></p>
+    <p id="result" style="word-break: break-all; color: green; font-weight: bold;"></p>
     <script>
       function getId() {
-        const link = document.getElementById('link').value;
-        const match = link.match(/\\/d\\/([a-zA-Z0-9-_]+)/);
-        document.getElementById('result').innerText = match ? match[1] : 'Invalid link';
+        const link = document.getElementById('link').value.trim();
+        let id = null;
+        
+        // Pattern 1: /d/{id} (for documents)
+        let match = link.match(/\\/d\\/([a-zA-Z0-9-_]+)/);
+        if (match) {
+          id = match[1];
+        }
+        
+        // Pattern 2: /folders/{id} (for folders)
+        if (!id) {
+          match = link.match(/\\/folders\\/([a-zA-Z0-9-_]+)/);
+          if (match) {
+            id = match[1];
+          }
+        }
+        
+        // Pattern 3: id={id} (query parameter)
+        if (!id) {
+          match = link.match(/[?&]id=([a-zA-Z0-9-_]+)/);
+          if (match) {
+            id = match[1];
+          }
+        }
+        
+        // Pattern 4: Chỉ ID thuần (không có URL)
+        if (!id && /^[a-zA-Z0-9-_]+$/.test(link)) {
+          id = link;
+        }
+        
+        document.getElementById('result').innerText = id ? id : 'Invalid link - không tìm thấy ID';
+        document.getElementById('result').style.color = id ? 'green' : 'red';
       }
     </script>
-  `).setWidth(400).setHeight(200);
-  SpreadsheetApp.getUi().showModalDialog(html, 'Get Google Doc ID');
+  `).setWidth(500).setHeight(220);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Get Google Doc/Drive ID');
 }
-
